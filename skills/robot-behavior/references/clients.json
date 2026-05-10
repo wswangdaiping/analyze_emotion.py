@@ -1,0 +1,13 @@
+{
+  "clients": {
+    "milk_duos_001": {
+      "webhook_url": "http://192.168.1.xxx:8765/action/milk_duos_001",
+      "description": "Milk DuoS 动作执行端",
+      "type": "action_executor",
+      "status": "active",
+      "registered_at": "2026-04-23T18:00:00+08:00"
+    }
+  },
+  "default_client": "milk_duos_001",
+  "notes": "请将 192.168.1.xxx 替换为实际的 OpenClaw 服务器 IP 地址"
+}

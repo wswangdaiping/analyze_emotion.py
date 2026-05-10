@@ -1,0 +1,20 @@
+[Unit]
+Description=OpenClaw Webhook Receiver
+After=network.target
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/.openclaw/workspace/services/webhook-receiver
+ExecStart=/usr/bin/python3 /home/admin/.openclaw/workspace/services/webhook-receiver/server.py
+Restart=always
+RestartSec=5
+Environment=DASHSCOPE_API_KEY=sk-8e08c4db21e1485197dfd3571cc51f0a
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openclaw-webhook
+
+[Install]
+WantedBy=multi-user.target
