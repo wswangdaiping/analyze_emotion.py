@@ -161,3 +161,41 @@ openclaw cron add --schedule "*/5 * * * *" --task "检查情绪队列并处理"
 需要处理 Agent 异步执行的结果回调
 配置复杂度增加
 如果需要多渠道接入：直接使用 OpenClaw 的 channel plugins（Discord/Telegram/飞书），完全绕过 HTTP 端点。
+
+---
+
+## 我（Claude Code）发给 OpenClaw 的第二轮提示词
+
+---
+
+我已完成 server.py 的双模式改造。现在 POST /emotion?mode=agent 会调用：
+
+  openclaw sessions_spawn --task "分析以下情绪文本并生成机器人动作序列：{content}" --label "emotion-{session_id}" --runtime "subagent"
+
+请你在 OpenClaw 侧完成以下 3 项配置，使 Agent 模式可用：
+
+### 1. 确认 sessions_spawn 可用
+
+运行以下命令验证：
+  openclaw sessions_spawn --task "测试：我很开心" --label "test-001" --runtime "subagent"
+
+确认 Agent 能启动并读取 robot-behavior/SKILL.md。
+
+### 2. 配置 Skill 链式调用
+
+在 skills/robot-behavior/SKILL.md 中添加链式调用规则，使 Agent 在生成动作序列后自动调用 json-webhook-skill，把结果 POST 到队列服务：
+
+  目标 URL: http://127.0.0.1:8765/action/milk_duos_001
+  请求体: {"action_sequence": [...], "emotion": "..."}
+
+### 3. 端到端验证
+
+配置完成后，我会从本地执行：
+  curl -X POST http://<ecs-ip>:8765/emotion?mode=agent \
+    -H "Content-Type: application/json" \
+    -d '{"content":"我今天很开心"}'
+
+请确认：
+  a. sessions_spawn 是否实际可用？有没有权限或路径问题？
+  b. skill 链式调用是否需要额外的 Gateway 配置？
+  c. 如果不能实现，卡点在哪里？是否有替代方案？

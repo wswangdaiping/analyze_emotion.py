@@ -1,3 +1,49 @@
+## 变更记录：/emotion 双模式支持（direct + agent）
+
+**日期**: 2026-05-10
+
+**改动文件**:
+- `services/webhook-receiver/server.py`
+
+**改动原因**: 支持 OpenClaw Agent 模式作为可选路径，与 subprocess 直调并存，用于小步验证 Agent 编排效果。
+
+**改动内容**:
+- `do_POST`: `/emotion` 路由改为传递 `parsed.query`，以便解析 URL 参数。
+- `handle_emotion(self, query="")`: 签名新增 `query` 参数；顶部新增 `?mode=` 解析逻辑，支持 `direct`（默认）和 `agent` 两种模式。
+- 新增 `_handle_emotion_agent(content, session_id)`: Agent 模式处理器，通过 `subprocess.Popen(["openclaw", "sessions_spawn", ...])` 异步触发 OpenClaw Agent；立即返回 `{"status": "processing", "mode": "agent", ...}`；客户端通过 `GET /poll/{client_id}` 获取结果。
+- 原有 subprocess 直调逻辑保持不变，作为默认 `direct` 模式。
+
+**两种模式对比**:
+
+| 模式 | 请求 | 响应 | 行为 |
+|------|------|------|------|
+| direct（默认） | `POST /emotion` | 同步返回 action_sequence | subprocess 直调 analyze_emotion.py |
+| agent（新增） | `POST /emotion?mode=agent` | 立即返回 processing | 异步触发 OpenClaw sessions_spawn |
+
+**验证命令**:
+```bash
+python -m py_compile services/webhook-receiver/server.py
+
+# direct 模式（不受影响）
+curl -X POST http://127.0.0.1:8765/emotion \
+  -H "Content-Type: application/json" \
+  -d '{"content":"我很开心"}'
+
+# agent 模式（需 OpenClaw 侧配置完成后才可验证完整链路）
+curl -X POST 'http://127.0.0.1:8765/emotion?mode=agent' \
+  -H "Content-Type: application/json" \
+  -d '{"content":"我很开心"}'
+```
+
+**上传给 openclaw 时注意**:
+- 需要上传:
+  - `services/webhook-receiver/server.py`
+- 不需要上传:
+  - 本地 `__pycache__/`
+  - 本地日志文件
+
+---
+
 ## 变更记录：安全与可迁移配置化（去硬编码/去绝对路径）
 
 **改动文件**:
