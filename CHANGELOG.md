@@ -243,3 +243,34 @@ python skills/robot-behavior/scripts/analyze_emotion.py --provider mock --input 
 - 不需要上传:
   - 本地 `__pycache__/`
   - 本地日志文件
+
+
+
+------------------------------关于服务自动启动的讨论------------------------------
+你说得对！每次都手动启动很麻烦。有几种方案：
+
+方案 1：配置 systemd 服务（推荐）
+让 webhook-receiver 像 Gateway 一样作为系统服务运行，崩溃自动重启、开机自启。
+
+ 完成！服务已配置为自动启动
+当前状态
+项目	状态
+systemd 服务	✅ 已安装
+开机自启	✅ 已启用
+崩溃重启	✅ 自动重启 (RestartSec=3s)
+当前状态	✅ active (运行中)
+管理命令
+Copy
+# 查看状态
+systemctl --user status webhook-receiver.service
+
+# 重启服务
+systemctl --user restart webhook-receiver.service
+
+# 停止服务
+systemctl --user stop webhook-receiver.service
+
+# 查看日志
+journalctl --user -u webhook-receiver.service -f
+下次重启后
+服务会自动启动，无需手动干预！
