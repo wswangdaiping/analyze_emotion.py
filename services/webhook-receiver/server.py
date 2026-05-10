@@ -314,9 +314,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
         path = parsed.path
         
         # 接收情绪数据：POST /emotion
-        # 支持 ?mode=agent 切换为 OpenClaw Agent 异步处理
         if path == "/emotion":
-            self.handle_emotion(parsed.query)
+            self.handle_emotion()
             return
         
         # 直接发送动作：POST /action/{client_id}
@@ -333,12 +332,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
         
         self.send_json_response(404, {"error": "Not found"})
     
-    def handle_emotion(self, query=""):
-        """处理情绪数据
-
-        Args:
-            query: URL query string，支持 ?mode=agent 切换为 OpenClaw Agent 处理
-        """
+    def handle_emotion(self):
+        """处理情绪数据"""
         try:
             if not self.require_api_key():
                 return
@@ -350,13 +345,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
             content = data.get("content", "")
             session_id = data.get("session_id", "default")
 
-            # 解析 mode 参数：?mode=agent 触发 OpenClaw Agent，默认 direct
-            params = parse_qs(query) if query else {}
-            modes = params.get("mode", ["direct"])
-            mode = modes[0] if modes else "direct"
-
             if not content:
-                # 空内容降级（两种模式相同）
+                # 空内容降级：直接返回待机动作，保持接口字段不变
                 action_sequence = [0]
                 emotion = "calm"
                 client_id = "milk_duos_001"
@@ -371,13 +361,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 })
                 return
 
-            logger.info(f"收到情绪数据：{content[:100]} [mode={mode}]")
+            logger.info(f"收到情绪数据：{content[:100]}")
 
-            # Agent 模式：触发 OpenClaw Agent 异步处理
-            if mode == "agent":
-                return self._handle_emotion_agent(content, session_id)
-
-            # 默认 direct 模式：直接调用 analyze_emotion.py
             # 调用 robot-behavior 分析情绪
             result = analyze_emotion(content)
             
@@ -414,65 +399,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
         except Exception as e:
             logger.error(f"处理情绪数据失败：{e}")
             self.send_json_response(500, {"error": str(e)})
-
-    def _handle_emotion_agent(self, content, session_id):
-        """Agent 模式：触发 OpenClaw Agent 异步处理情绪
-
-        流程：
-        1. 调用 openclaw sessions_spawn 触发 Agent
-        2. Agent 读取 robot-behavior SKILL.md → 调用 analyze_emotion.py
-        3. Agent 链式调用 json-webhook-skill → POST /action/{client_id}
-        4. server.py 立即返回 processing 状态，客户端通过轮询获取结果
-        """
-        client_id = "milk_duos_001"
-        label = f"emotion-{session_id}"
-        task = (
-            f"分析以下情绪文本并生成机器人动作序列：{content}"
-        )
-
-        try:
-            subprocess.Popen(
-                [
-                    "openclaw", "sessions_spawn",
-                    "--task", task,
-                    "--label", label,
-                    "--runtime", "subagent",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-
-            logger.info(f"Agent 模式：已触发 OpenClaw Agent [label={label}]")
-
-            self.send_json_response(200, {
-                "status": "processing",
-                "mode": "agent",
-                "session_label": label,
-                "client_id": client_id,
-                "message": (
-                    "Agent 正在分析情绪，动作将自动入队。"
-                    f"请通过 GET /poll/{client_id} 获取结果。"
-                ),
-            })
-        except FileNotFoundError:
-            logger.error("Agent 模式失败：找不到 openclaw 命令")
-            self.send_json_response(500, {
-                "status": "error",
-                "mode": "agent",
-                "error_code": "AGENT_NOT_FOUND",
-                "error_message": (
-                    "openclaw CLI 不可用，请确认 OpenClaw 已安装并在 PATH 中。"
-                    "在 ECS 上通常位于 /home/admin/.openclaw/ 目录下。"
-                ),
-            })
-        except Exception as exc:
-            logger.error(f"Agent 模式失败：{exc}")
-            self.send_json_response(500, {
-                "status": "error",
-                "mode": "agent",
-                "error_code": "AGENT_SPAWN_FAILED",
-                "error_message": str(exc),
-            })
 
     def handle_poll(self, client_id: str):
         """处理轮询请求"""

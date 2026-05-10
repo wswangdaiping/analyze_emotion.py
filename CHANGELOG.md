@@ -1,46 +1,24 @@
-## 变更记录：/emotion 双模式支持（direct + agent）
+## 变更记录：与 OpenClaw 交叉确认架构方案（无代码改动）
 
 **日期**: 2026-05-10
 
 **改动文件**:
-- `services/webhook-receiver/server.py`
+- 无（尝试了双模式改造后回退）
 
-**改动原因**: 支持 OpenClaw Agent 模式作为可选路径，与 subprocess 直调并存，用于小步验证 Agent 编排效果。
+**过程**:
+1. 提出 `/emotion?mode=agent` 双模式方案，让 OpenClaw Agent 通过 `sessions_spawn` 编排 skill。在 server.py 中实现后交由 OpenClaw 验证。
+2. OpenClaw 确认：`sessions_spawn` 不是 CLI 命令，是 Agent 内部函数；方案 B（`openclaw agent --to`）需要消息渠道入口；方案 C（Gateway WebSocket）无公开文档。
+3. 结论：OpenClaw 当前版本无法作为后端编排层被 server.py 程序化调用。其 Agent/Skill 系统设计目标是面向人机对话（Discord/微信等渠道），而非服务端 API 编排。
+4. 已回退所有双模式代码，server.py 保持原有 subprocess 直调架构。
 
-**改动内容**:
-- `do_POST`: `/emotion` 路由改为传递 `parsed.query`，以便解析 URL 参数。
-- `handle_emotion(self, query="")`: 签名新增 `query` 参数；顶部新增 `?mode=` 解析逻辑，支持 `direct`（默认）和 `agent` 两种模式。
-- 新增 `_handle_emotion_agent(content, session_id)`: Agent 模式处理器，通过 `subprocess.Popen(["openclaw", "sessions_spawn", ...])` 异步触发 OpenClaw Agent；立即返回 `{"status": "processing", "mode": "agent", ...}`；客户端通过 `GET /poll/{client_id}` 获取结果。
-- 原有 subprocess 直调逻辑保持不变，作为默认 `direct` 模式。
+**关键结论**:
+- 当前 subprocess 直调 `analyze_emotion.py` 是正确且最优的方案
+- OpenClaw 在项目中的实际角色：部署目录 + 多渠道接入（未来）+ Skill 文档载体
+- AI 编排层无法交给 OpenClaw Agent，这是其当前版本的能力边界
 
-**两种模式对比**:
-
-| 模式 | 请求 | 响应 | 行为 |
-|------|------|------|------|
-| direct（默认） | `POST /emotion` | 同步返回 action_sequence | subprocess 直调 analyze_emotion.py |
-| agent（新增） | `POST /emotion?mode=agent` | 立即返回 processing | 异步触发 OpenClaw sessions_spawn |
-
-**验证命令**:
-```bash
-python -m py_compile services/webhook-receiver/server.py
-
-# direct 模式（不受影响）
-curl -X POST http://127.0.0.1:8765/emotion \
-  -H "Content-Type: application/json" \
-  -d '{"content":"我很开心"}'
-
-# agent 模式（需 OpenClaw 侧配置完成后才可验证完整链路）
-curl -X POST 'http://127.0.0.1:8765/emotion?mode=agent' \
-  -H "Content-Type: application/json" \
-  -d '{"content":"我很开心"}'
-```
-
-**上传给 openclaw 时注意**:
-- 需要上传:
-  - `services/webhook-receiver/server.py`
-- 不需要上传:
-  - 本地 `__pycache__/`
-  - 本地日志文件
+**OpenClaw 在 ECS 上新增的文件**（不影响本地）:
+- `skills/robot-behavior/scripts/analyze_and_send.py` — 链式调用脚本（情绪分析 + Webhook 发送一体）
+- `skills/robot-behavior/SKILL.md` — 已更新链式调用说明
 
 ---
 
