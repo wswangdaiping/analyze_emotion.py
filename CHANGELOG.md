@@ -1,26 +1,49 @@
-## 变更记录：与 OpenClaw 交叉确认架构方案（无代码改动）
+## 变更记录：飞书渠道入口 + OpenClaw 架构定论（2026-05-10 全天工作总结）
 
-**日期**: 2026-05-10
+**改动文件**: 无本地代码改动（全部为 OpenClaw 侧配置）
 
-**改动文件**:
-- 无（尝试了双模式改造后回退）
+### 一、架构探索结论
 
-**过程**:
-1. 提出 `/emotion?mode=agent` 双模式方案，让 OpenClaw Agent 通过 `sessions_spawn` 编排 skill。在 server.py 中实现后交由 OpenClaw 验证。
-2. OpenClaw 确认：`sessions_spawn` 不是 CLI 命令，是 Agent 内部函数；方案 B（`openclaw agent --to`）需要消息渠道入口；方案 C（Gateway WebSocket）无公开文档。
-3. 结论：OpenClaw 当前版本无法作为后端编排层被 server.py 程序化调用。其 Agent/Skill 系统设计目标是面向人机对话（Discord/微信等渠道），而非服务端 API 编排。
-4. 已回退所有双模式代码，server.py 保持原有 subprocess 直调架构。
+与 OpenClaw 交叉验证三轮，得出明确定论：
+- `sessions_spawn` 不是 CLI 命令，Agent 编排无法被 server.py 程序化调用
+- 方案 B（CLI `--to` 参数）需消息渠道入口，方案 C（Gateway WebSocket）无公开文档
+- SKILL.md 只是文档，不是可执行工具；唯一实现 Agent 自主调用 skill 的路径是 MCP Tool 封装（需插件开发，短期不做）
+- **结论：当前 subprocess 直调架构是正确的。OpenClaw 的正确用法是人机对话入口，不是后端 API 编排。**
 
-**关键结论**:
-- 当前 subprocess 直调 `analyze_emotion.py` 是正确且最优的方案
-- OpenClaw 在项目中的实际角色：部署目录 + 多渠道接入（未来）+ Skill 文档载体
-- AI 编排层无法交给 OpenClaw Agent，这是其当前版本的能力边界
+### 二、飞书渠道入口（已完成）
 
-**OpenClaw 在 ECS 上新增的文件**（不影响本地）:
-- `skills/robot-behavior/scripts/analyze_and_send.py` — 链式调用脚本（情绪分析 + Webhook 发送一体）
-- `skills/robot-behavior/SKILL.md` — 已更新链式调用说明
+新增与 HTTP API 并行的第二入口：
 
----
+```
+入口1（HTTP）：WebApp → POST /emotion → server.py → subprocess → 队列 → DuoS
+入口2（Chat）：飞书私聊 → Gateway → Agent → exec → 队列 → DuoS
+```
+
+已验证通过：
+- ✅ 飞书应用"陪伴机器人"创建（App ID: cli_aa8a846735a11cc8，轮询模式）
+- ✅ 私聊消息触发 Agent
+- ✅ Agent exec analyze_emotion.py 返回正确 JSON
+- ✅ Agent POST /action/milk_duos_001 成功入队
+- ✅ systemd 服务配置（webhook-receiver 开机自启 + 崩溃重启）
+- ✅ 安全确认：exec 为数组传参（shouldSpawnWithShell=false），无命令注入风险
+
+### 三、系统提示词
+
+为 Agent 编写了完整工作流提示词：收到消息 → 分析情绪 → 发送动作 → 一句话回复。包含 emoji/情绪中文/动作中文三套映射表、4 种异常处理、禁止闲聊禁令。路径：`~/.openclaw/agents/main/agent/system-prompt.md`。
+
+### 四、补充优化方向
+
+在 `优化方向.md` 新增 10 个方向，覆盖架构集成、性能成本、稳定性、功能扩展四个维度。
+
+
+
+
+
+
+
+
+
+----------------------------------------之前的变更记录----------------------------------------
 
 ## 变更记录：安全与可迁移配置化（去硬编码/去绝对路径）
 
@@ -246,31 +269,3 @@ python skills/robot-behavior/scripts/analyze_emotion.py --provider mock --input 
 
 
 
-------------------------------关于服务自动启动的讨论------------------------------
-你说得对！每次都手动启动很麻烦。有几种方案：
-
-方案 1：配置 systemd 服务（推荐）
-让 webhook-receiver 像 Gateway 一样作为系统服务运行，崩溃自动重启、开机自启。
-
- 完成！服务已配置为自动启动
-当前状态
-项目	状态
-systemd 服务	✅ 已安装
-开机自启	✅ 已启用
-崩溃重启	✅ 自动重启 (RestartSec=3s)
-当前状态	✅ active (运行中)
-管理命令
-Copy
-# 查看状态
-systemctl --user status webhook-receiver.service
-
-# 重启服务
-systemctl --user restart webhook-receiver.service
-
-# 停止服务
-systemctl --user stop webhook-receiver.service
-
-# 查看日志
-journalctl --user -u webhook-receiver.service -f
-下次重启后
-服务会自动启动，无需手动干预！
