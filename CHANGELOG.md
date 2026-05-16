@@ -1,3 +1,347 @@
+# 变更记录：ykx    2026/5/15
+
+## 优化 1：修复分段阈值问题
+
+修改了 **1 个文件**：
+`/home/admin/.openclaw/workspace/skills/robot-behavior/scripts/analyze_emotion.py`
+
+共进行了 **6 处修改**：
+
+------
+
+### 修改 1：优化分段提示词 `SEGMENT_SYSTEM_PROMPT`
+
+**位置**：第 44-59 行
+
+**修改后**：
+
+```python
+SEGMENT_SYSTEM_PROMPT = """你是一个故事情节分析师。
+把输入的故事按情节节点分段，每段代表一个独立的动作/情绪事件。
+
+强制规则（必须遵守）：
+- 超过 3 句话 → 必须至少分 2 段（硬性要求）
+- 超过 6 句话 → 必须至少分 3 段（硬性要求）
+- 场景变化（地点/环境改变）→ 触发新段
+- 动作性质变化（主动/被动、前进/后退、站立/蹲下）→ 触发新段
+- 情绪强度变化（平静→紧张、紧张→兴奋）→ 触发新段
+- 时间推进词（突然、然后、接着、最后、此时、过了一会儿）→ 触发新段
+- 每段保持 1-3 句话，不要过长
+
+输出格式：
+- 纯 JSON 数组，每个元素是字符串（情节片段）
+- 不要解释，只输出 JSON
+- 如果故事本身只有 1-2 句话，可以返回单元素数组
+"""
+```
+
+------
+
+### 修改 2：添加句子计数函数 `count_sentences`
+
+**位置**：第 307-310 行（新增函数）
+
+**新增代码**：
+
+```python
+def count_sentences(text):
+    """计算句子数量（按中文/英文句末标点）"""
+    sentences = [s.strip() for s in re.split(r"[。！？!?]", text) if s.strip()]
+    return len(sentences)
+```
+
+------
+
+### 修改 3：重构 `segment_story` 函数（核心修改）
+
+**位置**：第 312-380 行
+
+**主要新增逻辑**：
+
+1. **计算句子数并构建强制分段提示**：
+
+```python
+sentence_count = count_sentences(text)
+
+if sentence_count >= 7:
+    force_segment_rule = f"这个故事有{sentence_count}句话，必须分成至少 4 段。"
+elif sentence_count >= 5:
+    force_segment_rule = f"这个故事有{sentence_count}句话，必须分成至少 3 段。"
+elif sentence_count >= 4:
+    force_segment_rule = f"这个故事有{sentence_count}句话，必须分成至少 2 段。"
+else:
+    force_segment_rule = "这个故事较短，可以保持 1 段。"
+
+prompt = f"故事文本：{text}\n\n{force_segment_rule}\n请返回 JSON 数组。"
+```
+
+1. **增加分段请求的超时时间**：
+
+```python
+segment_timeout = max(timeout, 30)
+result = call_dashscope_json(SEGMENT_SYSTEM_PROMPT, prompt, api_key, segment_timeout)
+```
+
+1. **添加分段合并逻辑**（防止模型每句切一段）：
+
+```python
+target_max = 4 if sentence_count >= 7 else 3
+
+if len(segments) > target_max:
+    print(f"[WARN] 分段过多：模型返回{len(segments)}段，将合并为{target_max}段", file=sys.stderr)
+    sentences = [s.strip() for s in re.split(r"[。！？!?]", text) if s.strip()]
+    segments = []
+    chunk_size = max(2, (len(sentences) + target_max - 1) // target_max)
+    for i in range(0, len(sentences), chunk_size):
+        chunk_sentences = sentences[i:i+chunk_size]
+        chunk = "。".join(chunk_sentences)
+        if chunk:
+            segments.append(chunk + "。")
+```
+
+1. **添加调试输出**：
+
+```python
+print(f"[DEBUG] 句子数={sentence_count}, 模型返回 segments={len(segments)}", file=sys.stderr)
+print(f"[DEBUG] 期望最少分段={expected_min}", file=sys.stderr)
+```
+
+------
+
+### 修改 4：修复 JSON 解析函数 `parse_json_maybe`
+
+**位置**：第 171-186 行
+
+**修改前**：
+
+```python
+def parse_json_maybe(text):
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            return None
+```
+
+**修改后**：
+
+```python
+def parse_json_maybe(text):
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # 尝试提取 JSON 对象或数组
+        # 使用非贪婪匹配，但允许内部有换行
+        match = re.search(r"(\{[\s\S]*?\}|\
+```
+
+------
+
+### 修改 5：增加 WebSocket 接收循环次数
+
+**位置**：第 263-265 行
+
+**修改后**：
+
+Copy
+
+```python
+ws.settimeout(timeout)
+full_text = ""
+# 增加最大迭代次数以接收长响应（如多段 JSON 数组）
+max_iterations = 150 if timeout >= 30 else 60
+for _ in range(max_iterations):
+    data = json.loads(ws.recv())
+```
+
+------
+
+## 修改效果对比
+
+| 指标              | 修改前         | 修改后     |
+| ----------------- | -------------- | ---------- |
+| **长故事分段**    | 1 段（不分段） | 3-4 段 ✅   |
+| **短故事超时**    | 5/5 超时       | 0/5 超时 ✅ |
+| **JSON 解析失败** | 频繁发生       | 已修复 ✅   |
+| **动作序列长度**  | 7-15 个        | 4-9 个 ✅   |
+
+所有修改都围绕解决核心问题：**长故事不分段**，通过强制分段规则 + 句子计数 + 合并逻辑实现。
+
+
+
+# 变更二：情绪弧线感知优化
+
+2026-05-15
+
+## 一、变更概述
+
+**优化目标:** 多段故事的情绪输出从单一标签升级为情绪演变路径，使机器人能够感知并表达故事中的情绪变化过程。
+
+**变更前:** 无论故事分多少段，最终只返回一个综合情绪标签（如 `"mixed"`）。
+
+**变更后:** 返回完整的情绪弧线（如 `"nervous → nervous → happy"`），同时保留每段的情绪标注。
+
+------
+
+## 二、修改文件清单
+
+| 文件路径                                           | 修改类型     | 修改内容                      |
+| -------------------------------------------------- | ------------ | ----------------------------- |
+| `skills/robot-behavior/scripts/analyze_emotion.py` | 核心逻辑修改 | `build_story_actions()` 函数  |
+| `tests/batch_story_test.py`                        | 测试脚本更新 | 捕获并输出 `emotion_arc` 字段 |
+
+------
+
+## 三、详细变更内容
+
+### 1. `analyze_emotion.py` (核心脚本)
+
+**位置:** `build_story_actions()` 函数（约第 518-575 行）
+
+#### 变更点 1: segment_debug 结构增强
+
+```python
+# 变更前
+segment_debug.append({"text": segment, "actions": [int(x) for x in seq if isinstance(x, int)]})
+
+# 变更后
+segment_debug.append({
+    "text": segment,
+    "actions": [int(x) for x in seq if isinstance(x, int)],
+    "emotion": emotion,  # 新增：每段独立情绪标注
+})
+```
+
+#### 变更点 2: 情绪弧线构建逻辑
+
+```python
+# 变更前
+if len(segments) == 1:
+    emotion_detected = segment_emotions[0] if segment_emotions else "calm"
+else:
+    uniq = {e for e in segment_emotions if e}
+    emotion_detected = segment_emotions[0] if len(uniq) == 1 and segment_emotions else "mixed"
+
+# 变更后
+if len(segments) == 1:
+    emotion_detected = segment_emotions[0] if segment_emotions else "calm"
+    emotion_arc = emotion_detected
+else:
+    # 构建情绪弧线：如 "calm → nervous → happy"
+    emotion_arc = " → ".join(segment_emotions)
+    # 如果所有段情绪相同，简化为单一标签
+    uniq = {e for e in segment_emotions if e}
+    emotion_detected = segment_emotions[0] if len(uniq) == 1 and segment_emotions else "mixed"
+```
+
+#### 变更点 3: 返回值新增字段
+
+```python
+return {
+    "status": "success",
+    "action_sequence": merged,
+    "action_names": [...],
+    "emotion_detected": emotion_detected,
+    "emotion_arc": emotion_arc,  # 新增字段
+    "rationale": rationale,
+    "segments": segment_debug,
+}
+```
+
+------
+
+### 2. `batch_story_test.py` (测试脚本)
+
+#### 变更点 1: 结果捕获
+
+```python
+results.append({
+    # ... 原有字段 ...
+    "emotion": json_output.get("emotion_detected", ""),
+    "emotion_arc": json_output.get("emotion_arc", ""),  # 新增
+    "segments_data": json_output.get("segments", []),   # 新增
+    "expected_emotion": case["emotion"],
+})
+```
+
+#### 变更点 2: 控制台输出
+
+```python
+# 变更后支持显示情绪弧线
+if arc_info:
+    print(f"  -> emotion={...}, arc={arc_info}, actions={...}, duration={...}s")
+else:
+    print(f"  -> emotion={...}, actions={...}, duration={...}s")
+```
+
+#### 变更点 3: Markdown 报告表格
+
+Copy
+
+```python
+# 表头新增 Emotion Arc 列
+report.append("| Case | Group | Segments | Actions | Duration(s) | Emotion | Emotion Arc | Warning | Expected | Actual |")
+```
+
+------
+
+## 四、测试结果对比
+
+### 短故事（单段）
+
+| Case | 情绪弧线    | 说明                |
+| ---- | ----------- | ------------------- |
+| A    | `surprised` | 单段，弧线=单一情绪 |
+| B    | `scared`    | 单段，弧线=单一情绪 |
+| C    | `happy`     | 单段，弧线=单一情绪 |
+| D    | `happy`     | ✅ 完全匹配          |
+
+### 长故事（多段）
+
+| Case | 分段 | 情绪弧线                        | 情绪演变解读                                  |
+| ---- | ---- | ------------------------------- | --------------------------------------------- |
+| E    | 2    | `calm → happy`                  | 平静购物 → 开心离开                           |
+| L1   | 3    | `nervous → nervous → happy`     | 紧张进入密林 → 紧张探索 → 开心发现宝藏        |
+| L2   | 3    | `nervous → scared → scared`     | 紧张出发 → 害怕进入火场 → 害怕救援            |
+| L3   | 4    | `nervous → calm → calm → happy` | 紧张待发 → 平静比赛 → 平静跨越障碍 → 开心庆祝 |
+
+------
+
+## 五、影响范围
+
+| 影响项         | 说明                                                         |
+| -------------- | ------------------------------------------------------------ |
+| **向后兼容性** | ✅ 完全兼容 - `emotion_detected` 字段保持不变，仅新增 `emotion_arc` |
+| **下游消费方** | 需要消费情绪弧线的代码可直接读取 `emotion_arc` 字段          |
+| **测试脚本**   | 已更新以捕获和展示新字段                                     |
+| **性能影响**   | 无 - 情绪检测原本就在逐段执行，只是之前未输出                |
+
+------
+
+## 八、文件位置
+
+| 文件      | 路径                                                         |
+| --------- | ------------------------------------------------------------ |
+| 核心脚本  | `/home/admin/.openclaw/workspace/skills/robot-behavior/scripts/analyze_emotion.py` |
+| 测试脚本  | `/home/admin/.openclaw/workspace/tests/batch_story_test.py`  |
+| 测试报告  | `/home/admin/.openclaw/workspace/tests/batch_story_report_dashscope.md` |
+| JSON 数据 | `/home/admin/.openclaw/workspace/tests/batch_story_report_dashscope.json` |
+
+
+
+
+
+
+
 ## 变更记录：飞书渠道入口 + OpenClaw 架构定论（2026-05-10 全天工作总结）
 
 **改动文件**: 无本地代码改动（全部为 OpenClaw 侧配置 + 文档更新）

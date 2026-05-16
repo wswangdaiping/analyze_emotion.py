@@ -58,12 +58,19 @@ ACTION_MAP = {
 SEGMENT_SYSTEM_PROMPT = """你是一个故事情节分析师。
 把输入的故事按情节节点分段，每段代表一个独立的动作/情绪事件。
 
-规则：
-- 按情节转折点切割，不按句子切割
-- 每段 1-3 句话
-- 输出纯 JSON 数组，每个元素是字符串
-- 不要解释
-- 如果无法有效分段，返回只包含原文的单元素数组
+强制规则（必须遵守）：
+- 超过 3 句话 → 必须至少分 2 段（硬性要求）
+- 超过 6 句话 → 必须至少分 3 段（硬性要求）
+- 场景变化（地点/环境改变）→ 触发新段
+- 动作性质变化（主动/被动、前进/后退、站立/蹲下）→ 触发新段
+- 情绪强度变化（平静→紧张、紧张→兴奋）→ 触发新段
+- 时间推进词（突然、然后、接着、最后、此时、过了一会儿）→ 触发新段
+- 每段保持 1-3 句话，不要过长
+
+输出格式：
+- 纯 JSON 数组，每个元素是字符串（情节片段）
+- 不要解释，只输出 JSON
+- 如果故事本身只有 1-2 句话，可以返回单元素数组
 """
 
 ACTION_SYSTEM_PROMPT = """你是一个机器人动作编导。
@@ -168,11 +175,18 @@ def parse_json_maybe(text):
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
+        # 尝试提取 JSON 对象或数组
+        # 使用非贪婪匹配，但允许内部有换行
+        match = re.search(r"(\{[\s\S]*?\}|\[[\s\S]*?\])", text)
         if not match:
             return None
         try:
-            return json.loads(match.group(1))
+            # 清理 JSON 字符串：移除行首行尾的空白
+            json_str = match.group(1)
+            # 移除字符串元素内部的多余空白（保留结构）
+            json_str = re.sub(r'\n\s*', '', json_str)
+            json_str = re.sub(r'\s+', ' ', json_str)
+            return json.loads(json_str)
         except json.JSONDecodeError:
             return None
 
@@ -248,7 +262,9 @@ def call_dashscope_json(system_prompt, user_prompt, api_key, timeout=15):
 
         ws.settimeout(timeout)
         full_text = ""
-        for _ in range(60):
+        # 增加最大迭代次数以接收长响应（如多段 JSON 数组）
+        max_iterations = 150 if timeout >= 30 else 60
+        for _ in range(max_iterations):
             data = json.loads(ws.recv())
             msg_type = data.get("type", "")
             if msg_type == "response.text.delta":
@@ -298,6 +314,12 @@ def call_dashscope_json(system_prompt, user_prompt, api_key, timeout=15):
                 pass
 
 
+def count_sentences(text):
+    """计算句子数量（按中文/英文句末标点）"""
+    sentences = [s.strip() for s in re.split(r"[。！？!?]", text) if s.strip()]
+    return len(sentences)
+
+
 def segment_story(text, provider, api_key, timeout):
     if provider == "mock":
         chunks = [s.strip() for s in re.split(r"[。！？!?]", text) if s.strip()]
@@ -305,13 +327,28 @@ def segment_story(text, provider, api_key, timeout):
             return [text]
         return chunks
 
-    prompt = f"故事文本：{text}\n请返回 JSON 数组。"
+    # 先计算句子数量，决定分段策略
+    sentence_count = count_sentences(text)
+    
+    # 构建强制分段提示
+    if sentence_count >= 7:
+        force_segment_rule = f"这个故事有{sentence_count}句话，必须分成至少 4 段。"
+    elif sentence_count >= 5:
+        force_segment_rule = f"这个故事有{sentence_count}句话，必须分成至少 3 段。"
+    elif sentence_count >= 4:
+        force_segment_rule = f"这个故事有{sentence_count}句话，必须分成至少 2 段。"
+    else:
+        force_segment_rule = "这个故事较短，可以保持 1 段。"
+
+    prompt = f"故事文本：{text}\n\n{force_segment_rule}\n请返回 JSON 数组。"
     print("[DEBUG] segment_story prompt:", debug_safe_repr(prompt), file=sys.stderr)
+    # 分段请求需要更长超时，因为可能返回多段 JSON 数组
+    segment_timeout = max(timeout, 30)
     result = call_dashscope_json(
         SEGMENT_SYSTEM_PROMPT,
         prompt,
         api_key,
-        timeout,
+        segment_timeout,
     )
     if not result.get("ok"):
         print("[DEBUG] segment_story error:", debug_safe_repr(json.dumps(result.get("error", {}), ensure_ascii=False)), file=sys.stderr)
@@ -320,6 +357,54 @@ def segment_story(text, provider, api_key, timeout):
     if not isinstance(data, list):
         return [text]
     segments = [str(item).strip() for item in data if str(item).strip()]
+    
+    # 调试输出
+    print(f"[DEBUG] 句子数={sentence_count}, 模型返回 segments={len(segments)}", file=sys.stderr)
+    
+    # 验证分段数量是否符合要求
+    expected_min = 1
+    if sentence_count >= 7:
+        expected_min = 4
+    elif sentence_count >= 5:
+        expected_min = 3
+    elif sentence_count >= 4:
+        expected_min = 2
+    
+    print(f"[DEBUG] 期望最少分段={expected_min}", file=sys.stderr)
+    
+    # 模型可能返回过多分段（每句 1 段），需要合并成合理的情节单元
+    # 目标：短故事 2-3 段，长故事 3-4 段
+    target_max = 4 if sentence_count >= 7 else 3
+    
+    if len(segments) > target_max:
+        print(f"[WARN] 分段过多：模型返回{len(segments)}段，将合并为{target_max}段", file=sys.stderr)
+        # 合并策略：按情节单元合并（每 2-3 句合并为 1 段）
+        sentences = [s.strip() for s in re.split(r"[。！？!?]", text) if s.strip()]
+        segments = []
+        chunk_size = max(2, (len(sentences) + target_max - 1) // target_max)  # 向上取整
+        for i in range(0, len(sentences), chunk_size):
+            chunk_sentences = sentences[i:i+chunk_size]
+            chunk = "。".join(chunk_sentences)
+            if chunk:
+                segments.append(chunk + "。")
+        print(f"[DEBUG] 合并后 segments={len(segments)}", file=sys.stderr)
+    
+    if len(segments) < expected_min:
+        print(f"[WARN] 分段数量不足：期望>={expected_min}，实际={len(segments)}，将回退到按句子切割", file=sys.stderr)
+        # 回退：按句子切割后合并成符合要求的段数
+        sentences = [s.strip() for s in re.split(r"[。！？!?]", text) if s.strip()]
+        print(f"[DEBUG] 回退模式：切割得到{len(sentences)}个句子", file=sys.stderr)
+        if len(sentences) >= expected_min:
+            segments = []
+            chunk_size = max(2, len(sentences) // expected_min)
+            for i in range(0, len(sentences), chunk_size):
+                chunk = "。".join(sentences[i:i+chunk_size])
+                if chunk:
+                    segments.append(chunk + "。")
+            print(f"[DEBUG] 回退后 segments={len(segments)}", file=sys.stderr)
+        if not segments:
+            segments = [text]
+    
     return segments if segments else [text]
 
 
@@ -458,14 +543,24 @@ def build_story_actions(text, provider, api_key, timeout):
         if non_zero:
             last_action = non_zero[-1]
 
-        segment_debug.append({"text": segment, "actions": [int(x) for x in seq if isinstance(x, int)]})
-        segment_emotions.append(detect_emotion(segment, provider, api_key, timeout))
+        emotion = detect_emotion(segment, provider, api_key, timeout)
+        segment_emotions.append(emotion)
+        segment_debug.append({
+            "text": segment,
+            "actions": [int(x) for x in seq if isinstance(x, int)],
+            "emotion": emotion,
+        })
 
     merged = normalize_action_sequence(merge_sequences(raw_sequences))
 
+    # 优化 2：情绪弧线感知 - 返回情绪变化路径而非单一标签
     if len(segments) == 1:
         emotion_detected = segment_emotions[0] if segment_emotions else "calm"
+        emotion_arc = emotion_detected
     else:
+        # 构建情绪弧线：如 "calm → nervous → happy"
+        emotion_arc = " → ".join(segment_emotions)
+        # 如果所有段情绪相同，简化为单一标签
         uniq = {e for e in segment_emotions if e}
         emotion_detected = segment_emotions[0] if len(uniq) == 1 and segment_emotions else "mixed"
 
@@ -476,6 +571,7 @@ def build_story_actions(text, provider, api_key, timeout):
         "action_sequence": merged,
         "action_names": [ACTION_MAP.get(a, "未知") for a in merged],
         "emotion_detected": emotion_detected,
+        "emotion_arc": emotion_arc,
         "rationale": rationale,
         "segments": segment_debug,
     }
