@@ -1,39 +1,119 @@
 ## 变更记录：飞书渠道入口 + OpenClaw 架构定论（2026-05-10 全天工作总结）
 
-**改动文件**: 无本地代码改动（全部为 OpenClaw 侧配置）
+**改动文件**: 无本地代码改动（全部为 OpenClaw 侧配置 + 文档更新）
 
-### 一、架构探索结论
+---
 
-与 OpenClaw 交叉验证三轮，得出明确定论：
-- `sessions_spawn` 不是 CLI 命令，Agent 编排无法被 server.py 程序化调用
-- 方案 B（CLI `--to` 参数）需消息渠道入口，方案 C（Gateway WebSocket）无公开文档
-- SKILL.md 只是文档，不是可执行工具；唯一实现 Agent 自主调用 skill 的路径是 MCP Tool 封装（需插件开发，短期不做）
-- **结论：当前 subprocess 直调架构是正确的。OpenClaw 的正确用法是人机对话入口，不是后端 API 编排。**
+### 一、架构探索结论（为什么 subprocess 直调是正确的）
 
-### 二、飞书渠道入口（已完成）
+**背景**：最初以为 OpenClaw 的 Skill 系统可以让 Agent 自动匹配并调用 skill，从而替代 server.py 中的 subprocess.Popen 调用。经过与 OpenClaw 三轮交叉验证，得出明确定论。
 
-新增与 HTTP API 并行的第二入口：
+**关键发现**：
 
+1. **SKILL.md 只是文档，不是可执行工具**
+   - `skills/robot-behavior/SKILL.md` 和 `skills/json-webhook-skill/SKILL.md` 是给人看的说明书，OpenClaw Agent 不会自动加载或执行它们
+   - Agent 能读取 SKILL.md 的内容作为上下文参考，但不能把它当作 function call 来调用
+   - 唯一实现 Agent 自主调用 skill 的路径是 MCP Tool 封装（需要开发 OpenClaw 插件，工作量大，短期不做）
+
+2. **`sessions_spawn` 不存在于 CLI**
+   - 它是 OpenClaw Agent 的内部函数，不是对外暴露的 CLI 命令
+   - server.py 无法通过 `subprocess.run(["openclaw", "sessions_spawn", ...])` 来触发 Agent 编排
+   - 这意味着 Agent 编排不能被 server.py 程序化调用——它只能在消息渠道入口被用户触发
+
+3. **OpenClaw Gateway 不能替代 server.py 的 HTTP 服务**
+   - Gateway 是 WebSocket 服务，用于连接消息渠道（飞书、Discord 等），不是 HTTP API 网关
+   - 它不能托管 `/emotion`、`/poll` 等 REST 端点
+   - 方案 C（Gateway WebSocket 直连）无公开文档，不可行
+
+4. **最终结论**：
+   - **当前 subprocess 直调架构是正确的**——server.py 用 `subprocess.Popen([sys.executable, "analyze_emotion.py", "--input", text])` 是正确做法
+   - **OpenClaw 的正确用法是人机对话入口**，不是后端 API 编排引擎
+   - 项目形成"双入口并行"架构：HTTP API 一条线 + 飞书 Chat 一条线，共享同一套队列和硬件
+
+---
+
+### 二、飞书渠道入口（已完成并验证通过）
+
+**动机**：在原有 HTTP API 入口之外，新增飞书私聊作为第二入口。两条链路并行，共享同一套 ActionQueue 和 Milk DuoS 硬件。
+
+**架构**：
 ```
 入口1（HTTP）：WebApp → POST /emotion → server.py → subprocess → 队列 → DuoS
 入口2（Chat）：飞书私聊 → Gateway → Agent → exec → 队列 → DuoS
 ```
 
-已验证通过：
-- ✅ 飞书应用"陪伴机器人"创建（App ID: cli_aa8a846735a11cc8，轮询模式）
-- ✅ 私聊消息触发 Agent
-- ✅ Agent exec analyze_emotion.py 返回正确 JSON
-- ✅ Agent POST /action/milk_duos_001 成功入队
-- ✅ systemd 服务配置（webhook-receiver 开机自启 + 崩溃重启）
-- ✅ 安全确认：exec 为数组传参（shouldSpawnWithShell=false），无命令注入风险
+入口2 的详细链路：用户向飞书机器人发私聊 → OpenClaw Gateway 轮询飞书获取消息 → Agent 收到消息 → Agent 执行 `exec analyze_emotion.py --input "消息内容"` → 解析返回的 JSON → Agent 执行 `exec curl POST /action/milk_duos_001` 入队 → 开发板轮询 `/poll` 拿到动作 → DuoS 执行
 
-### 三、系统提示词
+**已验证通过的项目**：
+- ✅ 飞书应用"陪伴机器人"创建完成（App ID: cli_aa8a846735a11cc8，轮询模式，无需配置回调 URL）
+- ✅ 私聊消息能触发 Agent（每条消息都触发，群聊需 @提及）
+- ✅ Agent exec analyze_emotion.py 返回正确 JSON（情绪标签 + 动作序列）
+- ✅ Agent 能自动 POST /action/milk_duos_001 将动作入队（队列写入验证通过）
+- ✅ systemd 服务 webhook-receiver 配置为开机自启 + 崩溃自动重启
+- ✅ 安全确认：exec 使用数组传参 `["python3", "analyze_emotion.py", "--input", "..."]`，OpenClaw 设置 `shouldSpawnWithShell=false`，无命令注入风险
 
-为 Agent 编写了完整工作流提示词：收到消息 → 分析情绪 → 发送动作 → 一句话回复。包含 emoji/情绪中文/动作中文三套映射表、4 种异常处理、禁止闲聊禁令。路径：`~/.openclaw/agents/main/agent/system-prompt.md`。
+**当前限制**：飞书应用为"轮询模式"，非"事件订阅模式"。轮询模式下消息到达有 1-2 秒延迟，对体验影响可接受。
 
-### 四、补充优化方向
+---
 
-在 `优化方向.md` 新增 10 个方向，覆盖架构集成、性能成本、稳定性、功能扩展四个维度。
+### 三、系统提示词设计（给队友：Agent 的行为规范）
+
+**路径**：`~/.openclaw/agents/main/agent/system-prompt.md`（在 ECS 服务器上，不在本地仓库中）
+
+**设计思路**：Agent 的提示词定义了"收到消息 → exec analyze → 解析 JSON → POST 入队 → 一句话回复"的严格工作流，确保 Agent 不会闲聊、不会多问、不会跳过任何步骤。
+
+**包含内容**：
+1. **工作流指令**（5 步，每步都有"必须执行"的明确要求）
+2. **三套映射表**：
+   - Emoji → 情绪中文（9 个映射，如 😊 → 开心）
+   - 情绪中文 → 典型关键词
+   - 动作编号 → 动作中文名（0-10，如 1=向前移动、6=撒娇/蹭蹭）
+3. **异常处理**（5 种场景，每种都有明确的降级策略）
+   - 情绪分析失败 → 默认动作 [0] + 告知用户稍后再试
+   - /action 写入失败 → 告知用户网络异常
+   - 空输入 → 默认动作 [0]
+   - 分析超时（>30s）→ 降级
+   - 非中文输入 → 仍然分析但用中文回复
+4. **禁止行为**（用"禁止"而非"不要"的强硬措辞）
+   - 禁止反问用户（如"需要我做某某吗？""要不要让机器人跳舞？"）
+   - 禁止闲聊和发表自己的感受
+   - 禁止跳过 exec 步骤
+   - 禁止向用户解释技术细节
+
+**当前问题**：实测中发现 Agent 仍有闲聊倾向（如回复"要不要让机器人跳个舞？"而非直接执行）。已加强禁止行为措辞，但提示词调优是持续过程。详见 `优化方向.md` 的方向四。
+
+---
+
+### 四、优化方向分工（详见 优化方向.md）
+
+在 `优化方向.md` 新增 11 个优化方向，覆盖：
+- **架构集成**（分段阈值、情绪弧线、规则优先+降级链）
+- **性能成本**（动作密度、节奏标签、时长加权）
+- **稳定性**（长轮询、队列持久化、队列监控）
+- **功能扩展**（多渠道、会话追踪）
+
+并完成二人分工：
+
+| 负责人 | 模块 | 优先级最高项 |
+|--------|------|-------------|
+| 我     | Prompt 策略 + OpenClaw | 优化1(分段阈值) → 优化2(情绪弧线) → 方向七+十(规则优先+降级链) |
+| 队友   | 动作序列 + 服务端 | 方向八(长轮询) → 方向十一(队列监控) → 方向一(动作密度) → 方向二(节奏标签) |
+
+执行顺序已按依赖关系排列，见 `优化方向.md` 末尾的表格。
+
+---
+
+### 五、给队友的上下文（你接手前需要知道的）
+
+1. **项目部署在 ECS 上**，本地 D:\Project_SE\openclaw-project-export 是导出备份。上传文件到 ECS 通过 `scp` 到 `/home/admin/openclaw-workspace/`。
+
+2. **server.py（你的主要战场）** 是一个独立的 HTTP 服务（`python services/webhook-receiver/server.py`），启动后监听 8765 端口。核心是 ActionQueue 类（内存队列 + 定时清理），入口是 POST /emotion（调 subprocess 分析情绪）和 GET /poll（DuoS 开发板轮询）。
+
+3. **analyze_emotion.py（我的主要战场）** 是 AI 分析引擎，支持两阶段流程：先分段（segment_story），再逐段生成动作（generate_actions），通过 last_action 参数保证段间连续性。支持 `--provider mock`（本地规则）和 `--provider dashscope`（云端 AI）。
+
+4. **Agent 的 system prompt 在 ECS 上**，路径 `~/.openclaw/agents/main/agent/system-prompt.md`。如果要修改 Agent 行为，去 ECS 上改这个文件，不需要改本地代码。
+
+5. **CHANGELOG 约定**：每次修改后记录"改动文件、改动原因、改动内容（before/after）、验证命令、上传注意事项"。这是给你看的交接记录。
 
 
 
