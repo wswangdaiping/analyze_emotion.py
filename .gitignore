@@ -3,3 +3,5 @@
 .runtime
 .env
 .venv
+project_prompts
+blog
