@@ -4,4 +4,9 @@
 .env
 .venv
 project_prompts
-blog
+
+blog/
+__pycache__/
+*.pyc
+.runtime/
+.rendered/
