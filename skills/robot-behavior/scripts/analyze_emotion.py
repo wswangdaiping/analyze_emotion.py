@@ -199,7 +199,24 @@ def emotion_by_rule(text):
     return "calm"
 
 
-def call_dashscope_json(system_prompt, user_prompt, api_key, timeout=15):
+def _with_fallback_level(result, level):
+    result["fallback_level"] = level
+    return result
+
+
+def _fallback_reason(result):
+    error = result.get("error", {}) if isinstance(result, dict) else {}
+    code = error.get("error_code", "UNKNOWN_ERROR")
+    message = error.get("error_message", "")
+    return f"{code}: {message}" if message else code
+
+
+def _is_retryable_error(result):
+    error = result.get("error", {}) if isinstance(result, dict) else {}
+    return error.get("error_code") in {"NETWORK_ERROR", "TIMEOUT_ERROR"}
+
+
+def _call_dashscope_json_once(system_prompt, user_prompt, api_key, timeout=15):
     ws = None
     try:
         try:
@@ -314,6 +331,26 @@ def call_dashscope_json(system_prompt, user_prompt, api_key, timeout=15):
                 pass
 
 
+def call_dashscope_json(system_prompt, user_prompt, api_key, timeout=15):
+    result = _call_dashscope_json_once(system_prompt, user_prompt, api_key, timeout)
+    if result.get("ok"):
+        return _with_fallback_level(result, 0)
+
+    if not _is_retryable_error(result):
+        print(f"[FALLBACK] {_fallback_reason(result)} → 降级到第2级", file=sys.stderr)
+        return _with_fallback_level(result, 2)
+
+    print(f"[FALLBACK] {_fallback_reason(result)} → 降级到第1级", file=sys.stderr)
+    time.sleep(2)
+
+    retry_result = _call_dashscope_json_once(system_prompt, user_prompt, api_key, timeout)
+    if retry_result.get("ok"):
+        return _with_fallback_level(retry_result, 1)
+
+    print(f"[FALLBACK] {_fallback_reason(retry_result)} → 降级到第2级", file=sys.stderr)
+    return _with_fallback_level(retry_result, 2)
+
+
 def count_sentences(text):
     """计算句子数量（按中文/英文句末标点）"""
     sentences = [s.strip() for s in re.split(r"[。！？!?]", text) if s.strip()]
@@ -324,8 +361,8 @@ def segment_story(text, provider, api_key, timeout):
     if provider == "mock":
         chunks = [s.strip() for s in re.split(r"[。！？!?]", text) if s.strip()]
         if not chunks:
-            return [text]
-        return chunks
+            return [text], 0
+        return chunks, 0
 
     # 先计算句子数量，决定分段策略
     sentence_count = count_sentences(text)
@@ -350,12 +387,13 @@ def segment_story(text, provider, api_key, timeout):
         api_key,
         segment_timeout,
     )
+    fallback_level = result.get("fallback_level", 0)
     if not result.get("ok"):
         print("[DEBUG] segment_story error:", debug_safe_repr(json.dumps(result.get("error", {}), ensure_ascii=False)), file=sys.stderr)
-        return [text]
+        return [text], fallback_level
     data = result.get("data")
     if not isinstance(data, list):
-        return [text]
+        return [text], fallback_level
     segments = [str(item).strip() for item in data if str(item).strip()]
     
     # 调试输出
@@ -405,7 +443,7 @@ def segment_story(text, provider, api_key, timeout):
         if not segments:
             segments = [text]
     
-    return segments if segments else [text]
+    return (segments if segments else [text]), fallback_level
 
 
 def generate_actions(segment, last_action, is_last, is_multi_segment, provider, api_key, timeout):
@@ -426,7 +464,7 @@ def generate_actions(segment, last_action, is_last, is_multi_segment, provider, 
             seq = [1] + seq
         if is_last:
             seq.append(0)
-        return seq
+        return seq, 0
 
     context_line = ""
     if last_action is not None:
@@ -443,12 +481,13 @@ def generate_actions(segment, last_action, is_last, is_multi_segment, provider, 
         user_prompt += "\n若序列包含动作6，6之前必须至少有1个非0动作（优先1或9），禁止直接 [6, 0]。"
     print("[DEBUG] generate_actions prompt:", debug_safe_repr(user_prompt), file=sys.stderr)
     result = call_dashscope_json(ACTION_SYSTEM_PROMPT, user_prompt, api_key, timeout)
+    fallback_level = result.get("fallback_level", 0)
     if not result.get("ok"):
         print("[DEBUG] generate_actions error:", debug_safe_repr(json.dumps(result.get("error", {}), ensure_ascii=False)), file=sys.stderr)
-        return [0]
+        return [0], fallback_level
     data = result.get("data")
     if not isinstance(data, list):
-        return [0]
+        return [0], fallback_level
     seq = []
     for item in data:
         try:
@@ -458,20 +497,20 @@ def generate_actions(segment, last_action, is_last, is_multi_segment, provider, 
         if value in ALLOWED_ACTIONS:
             seq.append(value)
     if not seq:
-        return [0]
+        return [0], fallback_level
     if not is_last:
         seq = [x for x in seq if x != 0]
         if not seq:
-            return [0]
+            return [0], fallback_level
     else:
         if seq[-1] != 0:
             seq.append(0)
-    return seq
+    return seq, fallback_level
 
 
 def detect_emotion(segment, provider, api_key, timeout):
     if provider == "mock":
-        return emotion_by_rule(segment)
+        return emotion_by_rule(segment), 0
 
     prompt = f"文本：{segment}\n仅输出 JSON。"
     print("[DEBUG] detect_emotion prompt:", debug_safe_repr(prompt), file=sys.stderr)
@@ -481,9 +520,10 @@ def detect_emotion(segment, provider, api_key, timeout):
         api_key,
         timeout,
     )
+    fallback_level = result.get("fallback_level", 0)
     if not result.get("ok"):
         print("[DEBUG] detect_emotion error:", debug_safe_repr(json.dumps(result.get("error", {}), ensure_ascii=False)), file=sys.stderr)
-        return emotion_by_rule(segment)
+        return emotion_by_rule(segment), fallback_level
     data = result.get("data")
     if isinstance(data, dict):
         emotion = str(data.get("emotion", "")).strip().lower()
@@ -497,8 +537,8 @@ def detect_emotion(segment, provider, api_key, timeout):
             "calm",
             "surprised",
         }:
-            return emotion
-    return emotion_by_rule(segment)
+            return emotion, fallback_level
+    return emotion_by_rule(segment), fallback_level
 
 
 def merge_sequences(sequences):
@@ -516,7 +556,9 @@ def merge_sequences(sequences):
 
 
 def build_story_actions(text, provider, api_key, timeout):
-    segments = segment_story(text, provider, api_key, timeout)
+    fallback_levels = []
+    segments, segment_fallback_level = segment_story(text, provider, api_key, timeout)
+    fallback_levels.append(segment_fallback_level)
     if not segments:
         segments = [text]
     is_multi_segment = len(segments) > 1
@@ -528,7 +570,7 @@ def build_story_actions(text, provider, api_key, timeout):
 
     for idx, segment in enumerate(segments):
         is_last = idx == len(segments) - 1
-        seq = generate_actions(
+        seq, action_fallback_level = generate_actions(
             segment,
             last_action,
             is_last,
@@ -537,13 +579,15 @@ def build_story_actions(text, provider, api_key, timeout):
             api_key,
             timeout,
         )
+        fallback_levels.append(action_fallback_level)
         raw_sequences.append(seq)
 
         non_zero = [x for x in seq if x != 0]
         if non_zero:
             last_action = non_zero[-1]
 
-        emotion = detect_emotion(segment, provider, api_key, timeout)
+        emotion, emotion_fallback_level = detect_emotion(segment, provider, api_key, timeout)
+        fallback_levels.append(emotion_fallback_level)
         segment_emotions.append(emotion)
         segment_debug.append({
             "text": segment,
@@ -565,6 +609,7 @@ def build_story_actions(text, provider, api_key, timeout):
         emotion_detected = segment_emotions[0] if len(uniq) == 1 and segment_emotions else "mixed"
 
     rationale = f"分{len(segments)}段处理：" + "→".join([s.get("text", "")[:12] for s in segment_debug])
+    max_fallback_level = max(fallback_levels) if fallback_levels else 0
 
     return {
         "status": "success",
@@ -574,6 +619,7 @@ def build_story_actions(text, provider, api_key, timeout):
         "emotion_arc": emotion_arc,
         "rationale": rationale,
         "segments": segment_debug,
+        "fallback_level": max_fallback_level,
     }
 
 

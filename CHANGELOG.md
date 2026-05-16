@@ -1,3 +1,127 @@
+# 变更记录：wdp    2026/5/16
+
+## 方向十：AI 调用降级链
+
+修改了 **1 个文件**：
+`/home/admin/.openclaw/workspace/skills/robot-behavior/scripts/analyze_emotion.py`
+
+本次改动围绕 DashScope API 异常时的可恢复能力展开，目标是让系统在网络、超时或依赖异常时仍能返回合法 JSON，并通过 `fallback_level` 标记本次分析是否发生降级。
+
+------
+
+### 修改 1：扩展 `call_dashscope_json()` 返回结构
+
+在原有 `ok`、`data`、`error` 字段基础上新增：
+
+```python
+"fallback_level": 0
+```
+
+含义如下：
+
+| fallback_level | 含义 |
+| -------------- | ---- |
+| 0 | 正常调用成功 |
+| 1 | 首次调用失败，等待 2 秒后重试成功 |
+| 2 | 重试后仍失败，进入默认/规则降级 |
+
+保留原有 `ok/data/error` 读取方式，调用方仍可按原逻辑判断成功或失败。
+
+------
+
+### 修改 2：新增 DashScope 调用重试与降级日志
+
+将单次 WebSocket 调用拆分为内部函数 `_call_dashscope_json_once()`，外层 `call_dashscope_json()` 负责降级链控制：
+
+1. 第一级：正常调用 DashScope API。
+2. 第二级：遇到网络或超时类错误后，等待 2 秒并自动重试一次。
+3. 第三级：重试仍失败，返回失败结果并标记 `fallback_level=2`。
+
+每次降级会向 stderr 输出：
+
+```text
+[FALLBACK] 原因 → 降级到第X级
+```
+
+非重试类错误（如缺少 `websocket-client` 依赖）会直接进入第 2 级降级，不做无意义重试。
+
+------
+
+### 修改 3：打通 `fallback_level` 传递路径
+
+为避免 `call_dashscope_json()` 的降级信息丢失，调整了三个业务函数的返回值：
+
+```python
+segment_story(...)     -> (segments, fallback_level)
+generate_actions(...) -> (seq, fallback_level)
+detect_emotion(...)   -> (emotion, fallback_level)
+```
+
+`mock` 模式不调用 API，因此固定返回 `fallback_level=0`。
+
+------
+
+### 修改 4：多段故事汇总最高降级级别
+
+`build_story_actions()` 新增 `fallback_levels` 列表，收集：
+
+- 分段调用的 `fallback_level`
+- 每一段 `generate_actions()` 的 `fallback_level`
+- 每一段 `detect_emotion()` 的 `fallback_level`
+
+最终使用：
+
+```python
+max_fallback_level = max(fallback_levels) if fallback_levels else 0
+```
+
+并在最终 JSON 中输出：
+
+```json
+"fallback_level": 0
+```
+
+这样可以保证多段故事中间任意一段 API 调用失败时，最终监控字段不会被后续成功调用覆盖。
+
+------
+
+## 测试结果
+
+### 本地验证
+
+| 测试项 | 结果 |
+| ------ | ---- |
+| 语法检查（`compile(..., "exec")`） | 通过 |
+| mock 模式正常路径 | 通过，`fallback_level=0` |
+| DashScope 异常路径（本地缺少 `websocket-client`） | 通过，合法 JSON 输出，动作兜底为 `[0]`，`fallback_level=2` |
+| 多段中间失败模拟 | 通过，第二段失败时最终 `fallback_level=2` |
+
+### OpenClaw 侧验证
+
+复制到 OpenClaw 后已验证：
+
+| 测试项 | 结果 |
+| ------ | ---- |
+| 语法检查 | 正常 |
+| 正常 DashScope 调用路径 | 符合预期 |
+| 降级路径 | 符合预期 |
+| 多段故事路径 | 符合预期 |
+
+------
+
+## 影响范围
+
+| 影响项 | 说明 |
+| ------ | ---- |
+| 接口兼容性 | 保持兼容，原有 `ok/data/error` 字段不变 |
+| 对外服务响应 | `server.py` 采用白名单式响应，不会把 `fallback_level` 直接暴露给 `/emotion` 调用方 |
+| 动作兜底 | `generate_actions()` 失败时仍返回 `[0]` |
+| 分段兜底 | `segment_story()` 失败时回退为原文单段 |
+| 情绪兜底 | `detect_emotion()` 失败时回退规则引擎 |
+
+本次改动完成了方向十的核心目标：**API 异常时系统不崩溃，仍返回可执行动作，并能通过 `fallback_level` 追踪最高降级级别**。
+
+
 # 变更记录：ykx    2026/5/15
 
 ## 优化 1：修复分段阈值问题
@@ -690,6 +814,5 @@ python skills/robot-behavior/scripts/analyze_emotion.py --provider mock --input 
 - 不需要上传:
   - 本地 `__pycache__/`
   - 本地日志文件
-
 
 
