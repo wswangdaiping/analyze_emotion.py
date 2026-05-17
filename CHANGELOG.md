@@ -466,7 +466,7 @@ report.append("| Case | Group | Segments | Actions | Duration(s) | Emotion | Emo
 
 
 
-## 变更记录：飞书渠道入口 + OpenClaw 架构定论（2026-05-10 全天工作总结）
+## 变更记录：飞书渠道入口 + OpenClaw 架构定论（2026-05-10 全天工作总结 - wdp）
 
 **改动文件**: 无本地代码改动（全部为 OpenClaw 侧配置 + 文档更新）
 
