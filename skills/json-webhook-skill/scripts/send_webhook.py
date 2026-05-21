@@ -25,7 +25,7 @@ except ImportError:
     sys.exit(1)
 
 
-def send_webhook(url: str, data: dict, headers: dict = None, timeout: int = 30) -> dict:
+def send_webhook(url: str, data: dict, headers: dict = None, timeout: int = 60) -> dict:
     """
     发送 POST 请求到 Webhook 地址
     
@@ -33,7 +33,7 @@ def send_webhook(url: str, data: dict, headers: dict = None, timeout: int = 30) 
         url: 目标 URL
         data: JSON 数据（字典）
         headers: 额外 Headers（可选）
-        timeout: 超时秒数（默认 30）
+        timeout: 超时秒数（默认 60）
     
     Returns:
         包含发送结果的字典
